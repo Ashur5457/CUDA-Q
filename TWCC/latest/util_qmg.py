@@ -9,22 +9,110 @@ from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
 
 class MoleculeQuantumStateGenerator():
-    def __init__(self, heavy_atom_size=5, ncpus=4, sanitize_method="strict", stereo_chiral=True):
+    def __init__(
+        self,
+        heavy_atom_size=5,
+        ncpus=4,
+        sanitize_method="strict",
+        stereo_chiral=True,
+        atom_weights=None,
+        atom_selection_bits=7,
+    ):
         self.size = heavy_atom_size
         self.effective_numbers = list(range(heavy_atom_size))
         self.ncpus = ncpus
-        self.atom_type_to_idx = {"C": 1, "O":2, "N": 3} # only supports C, O, N atoms now.
-        self.bond_type_to_idx = {Chem.rdchem.BondType.SINGLE: 1, Chem.rdchem.BondType.DOUBLE: 2, Chem.rdchem.BondType.TRIPLE: 3}
-        self.idx_to_atom_type = {1: "C", 2: "O", 3: "N"}
-        self.idx_to_bond_type = {1: Chem.rdchem.BondType.SINGLE, 2: Chem.rdchem.BondType.DOUBLE, 3: Chem.rdchem.BondType.TRIPLE}
-        self.qubits_per_type_atom = int(np.ceil(np.log2(len(self.atom_type_to_idx) + 1))) # How many qubits required for describing the quantum state of atom type
-        self.qubits_per_type_bond = int(np.ceil(np.log2(len(self.bond_type_to_idx) + 1))) # How many qubits required for describing the quantum state of bond type
-        self.n_qubits = int(self.size * self.qubits_per_type_atom + self.size * (self.size-1) / 2 * self.qubits_per_type_bond)
+
+        # 預設支援九種重元素，順序固定以維持位元對應不變
+        atom_sequence = ["C", "N", "O", "S", "P", "F", "Cl", "Br", "I"]
+        self.atom_type_to_idx = {atom: idx + 1 for idx, atom in enumerate(atom_sequence)}
+        self.idx_to_atom_type = {idx + 1: atom for idx, atom in enumerate(atom_sequence)}
+
+        default_weights = {
+            "C": 25,
+            "N": 25,
+            "O": 25,
+            "S": 5,
+            "P": 5,
+            "F": 5,
+            "Cl": 5,
+            "Br": 5,
+            "I": 5,
+        }
+        self.atom_weights = atom_weights or default_weights
+        # 僅保留支援的元素並依照 atom_sequence 的順序建立權重
+        self.atom_weights = {
+            atom: self.atom_weights.get(atom, default_weights[atom])
+            for atom in atom_sequence
+        }
+        self.atom_selection_bits = atom_selection_bits
+
+        self.bond_type_to_idx = {
+            Chem.rdchem.BondType.SINGLE: 1,
+            Chem.rdchem.BondType.DOUBLE: 2,
+            Chem.rdchem.BondType.TRIPLE: 3,
+            Chem.rdchem.BondType.AROMATIC: 4,
+        }
+        self.idx_to_bond_type = {
+            1: Chem.rdchem.BondType.SINGLE,
+            2: Chem.rdchem.BondType.DOUBLE,
+            3: Chem.rdchem.BondType.TRIPLE,
+            4: Chem.rdchem.BondType.AROMATIC,
+        }
+        self.aromatic_bond_idx = self.bond_type_to_idx[Chem.rdchem.BondType.AROMATIC]
+        # 量測位元長度可依需求調整
+        self.qubits_per_type_atom = atom_selection_bits
+        self.qubits_per_type_bond = int(
+            np.ceil(np.log2(len(self.bond_type_to_idx) + 1))
+        )
+        self.n_qubits = int(
+            self.size * self.qubits_per_type_atom
+            + self.size * (self.size - 1) / 2 * self.qubits_per_type_bond
+        )
         self.sanitize_method = sanitize_method
-        self.atom_valence_dict = {"C":4, "N":3, "O":2}
+        self.atom_valence_dict = {
+            "C": 4,
+            "N": 3,
+            "O": 2,
+            "S": 6,
+            "P": 5,
+            "F": 1,
+            "Cl": 1,
+            "Br": 1,
+            "I": 1,
+        }
         self.stereo_chiral = stereo_chiral
 
-    def decimal_to_binary(self, x, padding_length=2):
+        # 將權重轉換成累積分佈，供後續位元值對應元素
+        self._build_atom_weight_bins()
+
+    def _build_atom_weight_bins(self):
+        self.total_atom_weight = sum(self.atom_weights.values())
+        cumulative = 0
+        self.atom_weight_bins = []
+        self.atom_weight_encoding = {}
+        for atom, weight in self.atom_weights.items():
+            start = cumulative
+            cumulative += weight
+            self.atom_weight_bins.append((cumulative, atom))
+            self.atom_weight_encoding[atom] = (start, cumulative)
+
+    def _select_atom_from_value(self, value):
+        if self.total_atom_weight == 0:
+            return None
+        mod_value = value % self.total_atom_weight
+        # 將位元轉換的整數映射回累積權重區間，取得原子符號
+        for upper, atom in self.atom_weight_bins:
+            if mod_value < upper:
+                return atom
+        return None
+
+    def _encode_atom_to_value(self, atom):
+        if atom not in self.atom_weight_encoding:
+            return 0
+        start, _ = self.atom_weight_encoding[atom]
+        return start
+
+    def decimal_to_binary(self, x, padding_length=None):
         """
         Parameters:
         x (int): The decimal value.
@@ -32,8 +120,11 @@ class MoleculeQuantumStateGenerator():
         Returns:
         str: A binary bit string.
         """
-        bit = "0"*(padding_length-1) + bin(x)[2:]
-        return bit[-padding_length:] # -2 means we only take 4 possible states
+        if padding_length is None:
+            padding_length = self.qubits_per_type_atom
+        # 以固定長度補零，確保位元排列一致
+        bit = "0" * (padding_length - 1) + bin(x)[2:]
+        return bit[-padding_length:]
 
     def SmilesToConnectivity(self, smiles):
         """
@@ -48,7 +139,8 @@ class MoleculeQuantumStateGenerator():
         node_vector = np.zeros(self.size)
         adjacency_matrix = np.zeros((self.size, self.size))
         mol = Chem.MolFromSmiles(smiles)
-        Chem.Kekulize(mol)
+        if mol is None:
+            return node_vector, adjacency_matrix
         for atom in mol.GetAtoms():
             idx = atom.GetIdx()
             atom_type = atom.GetSymbol()
@@ -56,8 +148,12 @@ class MoleculeQuantumStateGenerator():
         for bond in mol.GetBonds():
             i = bond.GetBeginAtomIdx()
             j = bond.GetEndAtomIdx()
-            adjacency_matrix[i][j] = self.bond_type_to_idx[bond.GetBondType()]
-            adjacency_matrix[j][i] = self.bond_type_to_idx[bond.GetBondType()]
+            if bond.GetIsAromatic():
+                bond_type_idx = self.aromatic_bond_idx
+            else:
+                bond_type_idx = self.bond_type_to_idx.get(bond.GetBondType(), 0)
+            adjacency_matrix[i][j] = bond_type_idx
+            adjacency_matrix[j][i] = bond_type_idx
         return node_vector, adjacency_matrix
 
     def _rank_list(self, lst):
@@ -106,12 +202,25 @@ class MoleculeQuantumStateGenerator():
             else:
                 bond.SetStereo(Chem.rdchem.BondStereo.STEREOE)
         else:
-            begin_CIP_list = [int(neighbor.GetProp('_CIPRank')) for neighbor in begin_atom.GetNeighbors()
-                            if int(neighbor.GetProp('molAtomMapNumber')) != end_atom_map_number]
-            end_CIP_list = [int(neighbor.GetProp('_CIPRank')) for neighbor in end_atom.GetNeighbors()
-                            if int(neighbor.GetProp('molAtomMapNumber')) != begin_atom_map_number]
-            if self._can_sort_with_even_swaps(self._rank_list(begin_atom_neighbor_map), self._rank_list(begin_CIP_list)) == \
-                self._can_sort_with_even_swaps(self._rank_list(end_atom_neighbor_map), self._rank_list(end_CIP_list)):
+            begin_CIP_list = [
+                int(neighbor.GetProp('_CIPRank'))
+                for neighbor in begin_atom.GetNeighbors()
+                if int(neighbor.GetProp('molAtomMapNumber')) != end_atom_map_number
+            ]
+            end_CIP_list = [
+                int(neighbor.GetProp('_CIPRank'))
+                for neighbor in end_atom.GetNeighbors()
+                if int(neighbor.GetProp('molAtomMapNumber')) != begin_atom_map_number
+            ]
+            begin_even = self._can_sort_with_even_swaps(
+                self._rank_list(begin_atom_neighbor_map),
+                self._rank_list(begin_CIP_list),
+            )
+            end_even = self._can_sort_with_even_swaps(
+                self._rank_list(end_atom_neighbor_map),
+                self._rank_list(end_CIP_list),
+            )
+            if begin_even == end_even:
                 bond.SetStereo(Chem.rdchem.BondStereo.STEREOZ)
             else:
                 bond.SetStereo(Chem.rdchem.BondStereo.STEREOE)
@@ -133,6 +242,7 @@ class MoleculeQuantumStateGenerator():
         """
         mol = Chem.RWMol()
         mapping_num_2_molIdx = {}
+        # 為每個非零原子建立 RDKit 原子並保留原始索引
         for i, atom_type_idx in enumerate(node_vector):
             if atom_type_idx == 0:
                 continue
@@ -141,26 +251,58 @@ class MoleculeQuantumStateGenerator():
             molIdx = mol.AddAtom(a)
             mapping_num_2_molIdx.update({i: molIdx})
         # add bonds between adjacent atoms, only traverse half the matrix
+        uses_aromatic = False
         for ix, row in enumerate(adjacency_matrix):
             for iy_, bond_type_idx in enumerate(row[ix+1:]):
                 iy = ix + iy_ + 1
                 if bond_type_idx == 0:
                     continue
                 else:
-                    bond_type = self.idx_to_bond_type[bond_type_idx]
+                    bond_type = self.idx_to_bond_type.get(bond_type_idx)
+                    if bond_type is None:
+                        continue
+                    aromatic_edge = bond_type == Chem.rdchem.BondType.AROMATIC
+                    if aromatic_edge:
+                        uses_aromatic = True
                     try:
                         mol.AddBond(mapping_num_2_molIdx[ix], mapping_num_2_molIdx[iy], bond_type)
                     except:
                         return None
+                    if aromatic_edge:
+                        bond = mol.GetBondBetweenAtoms(mapping_num_2_molIdx[ix], mapping_num_2_molIdx[iy])
+                        if bond is None:
+                            return None
+                        bond.SetBondType(Chem.rdchem.BondType.AROMATIC)
+                        bond.SetIsAromatic(True)
+                        begin_atom = mol.GetAtomWithIdx(mapping_num_2_molIdx[ix])
+                        end_atom = mol.GetAtomWithIdx(mapping_num_2_molIdx[iy])
+                        begin_atom.SetIsAromatic(True)
+                        end_atom.SetIsAromatic(True)
         mol = mol.GetMol()
         if self.sanitize_method == "strict":
             try:
-                Chem.SanitizeMol(mol)
+                if uses_aromatic:
+                    sanitize_ops = (
+                        Chem.SanitizeFlags.SANITIZE_ALL
+                        ^ Chem.SanitizeFlags.SANITIZE_SETAROMATICITY
+                    )
+                    Chem.SanitizeMol(mol, sanitizeOps=sanitize_ops)
+                    Chem.SetAromaticity(mol)
+                else:
+                    Chem.SanitizeMol(mol)
             except:
                 return None
         elif self.sanitize_method == "soft":
             try:
-                Chem.SanitizeMol(mol)
+                if uses_aromatic:
+                    sanitize_ops = (
+                        Chem.SanitizeFlags.SANITIZE_ALL
+                        ^ Chem.SanitizeFlags.SANITIZE_SETAROMATICITY
+                    )
+                    Chem.SanitizeMol(mol, sanitizeOps=sanitize_ops)
+                    Chem.SetAromaticity(mol)
+                else:
+                    Chem.SanitizeMol(mol)
             except:
                 try:
                     for atom in mol.GetAtoms():
@@ -171,7 +313,15 @@ class MoleculeQuantumStateGenerator():
                             atom.SetFormalCharge(bond_count - 3)
                         elif atom.GetSymbol() == "c" and bond_count >= 5:
                             atom.SetFormalCharge(bond_count - 4)
-                    Chem.SanitizeMol(mol)
+                    if uses_aromatic:
+                        sanitize_ops = (
+                            Chem.SanitizeFlags.SANITIZE_ALL
+                            ^ Chem.SanitizeFlags.SANITIZE_SETAROMATICITY
+                        )
+                        Chem.SanitizeMol(mol, sanitizeOps=sanitize_ops)
+                        Chem.SetAromaticity(mol)
+                    else:
+                        Chem.SanitizeMol(mol)
                 except:
                     return None
 
@@ -193,26 +343,43 @@ class MoleculeQuantumStateGenerator():
         """
         quantum_state = ""
         for atom_idx in node_vector:
-            quantum_state += self.decimal_to_binary(int(atom_idx), padding_length=self.qubits_per_type_atom)
+            if int(atom_idx) == 0:
+                value = 0
+            else:
+                atom_symbol = self.idx_to_atom_type.get(int(atom_idx))
+                value = self._encode_atom_to_value(atom_symbol)
+            quantum_state += self.decimal_to_binary(
+                int(value), padding_length=self.qubits_per_type_atom
+            )
+        # 原子片段之後依序放入鍵的型別位元
         for ix, row in enumerate(adjacency_matrix):
             for bond_type_idx in row[ix+1:]:
                 quantum_state += self.decimal_to_binary(int(bond_type_idx), padding_length=self.qubits_per_type_bond)
         return quantum_state
 
     def QuantumStateToConnectivity(self, quantum_state):
-        node_state = quantum_state[:2*self.size]
-        bond_state = quantum_state[2*self.size:]
+        # 依照原本配置拆解原子位元數，再取出鍵位元區塊
+        node_bits = self.size * self.qubits_per_type_atom
+        node_state = quantum_state[:node_bits]
+        bond_state = quantum_state[node_bits:]
         node_vector = np.zeros(self.size)
         adjacency_matrix = np.zeros((self.size, self.size))
-        for i in range(0, len(node_state), 2):
-            node_vector[i//2] = int(node_state[i:i+2], 2)
-        row = 0
-        for i in range(0, len(bond_state), 2):
-            idx = i // 2
-            if idx == (2*(self.size-1) - (row+1) + 1) * (row+1) / 2:
-                row += 1
-            column = int(idx - (2*(self.size-1) - row + 1) * row / 2) + row + 1
-            bond_type_idx = int(bond_state[i:i+2], 2)
+        for i in range(self.size):
+            start = i * self.qubits_per_type_atom
+            atom_bits = node_state[start : start + self.qubits_per_type_atom]
+            atom_value = int(atom_bits, 2)
+            atom_symbol = self._select_atom_from_value(atom_value)
+            if atom_symbol:
+                node_vector[i] = self.atom_type_to_idx[atom_symbol]
+        bond_pairs = [
+            (i, j) for i in range(self.size - 1) for j in range(i + 1, self.size)
+        ]
+        for idx, (row, column) in enumerate(bond_pairs):
+            start = idx * self.qubits_per_type_bond
+            bond_bits = bond_state[start : start + self.qubits_per_type_bond]
+            bond_type_idx = int(bond_bits, 2)
+            if bond_type_idx not in self.idx_to_bond_type:
+                bond_type_idx = 0
             adjacency_matrix[row][column] = bond_type_idx
             adjacency_matrix[column][row] = bond_type_idx
         return node_vector, adjacency_matrix
@@ -237,17 +404,20 @@ class MoleculeQuantumStateGenerator():
         :param result_state: computational state derived from qiskit measurement outcomes
         :return: str of post-processed quantum state
         """
-        assert len(result_state) == self.size*(self.size+1)
+        expected_length = int(self.n_qubits)
+        assert len(result_state) == expected_length
         if reverse:
             result_state = result_state[::-1]
         quantum_state = ""
-        for i in range(self.size):
-            atom_start_idx = i*2 + i*(i-1)
-            quantum_state += result_state[atom_start_idx:atom_start_idx+2]
-        for i in range(1, self.size):
-            for a_k, j in enumerate(range(i, self.size)):
-                bond_start_idx = (i+1)*2 + 2*a_k + j*(j-1) + (i-1)*2
-                quantum_state += result_state[bond_start_idx:bond_start_idx+2]
+        idx = 0
+        for _ in range(self.size):
+            quantum_state += result_state[idx : idx + self.qubits_per_type_atom]
+            idx += self.qubits_per_type_atom
+        num_bonds = int(self.size * (self.size - 1) / 2)
+        # 逐段擷取鍵的位元資訊，重建原始排列
+        for _ in range(num_bonds):
+            quantum_state += result_state[idx : idx + self.qubits_per_type_bond]
+            idx += self.qubits_per_type_bond
         return quantum_state
 
     def generate_permutations(self, k):
@@ -298,6 +468,7 @@ class MoleculeQuantumStateGenerator():
         """
         valid_state_vector_mask = np.zeros(2**self.n_qubits)
         for decimal_index in set(data["decimal_index"]):
+            # 將資料集中出現的態標記為有效
             valid_state_vector_mask[int(decimal_index)] = 1
         return valid_state_vector_mask
 
@@ -312,6 +483,7 @@ def draw_top_molecules(smiles_dict, top_n=10, mols_per_row=5, mol_size=(300, 300
     - mol_size: Size of each molecule image, default is (300, 300)
     """
     
+    # 移除無法產生 SMILES 的條目，避免後續繪圖失敗
     filtered_dict = {k: v for k, v in smiles_dict.items() if k is not None}
     sorted_smiles = sorted(filtered_dict.items(), key=lambda x: x[1], reverse=True)[:top_n]
     
